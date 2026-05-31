@@ -1,0 +1,23 @@
+# Source-tree noise that the Docker build doesn't need.
+.git
+.github
+.idea
+.vscode
+.claude
+
+# Docs render on GitHub, not in the image.
+*.md
+docs
+
+# License + changelog ship with the source distribution, not the image.
+LICENSE
+CHANGELOG.md
+
+# Local secrets — must never bake into images.
+.env
+.env.*
+
+# Pre-built artefacts.
+*.test
+*.out
+coverage.out

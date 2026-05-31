@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_TEST_DSN: postgres://postgres:test@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (includes storepg integration tests against the postgres service)
+        run: go test ./... -race -count=1
+
+      - name: Build binaries
+        run: go build ./cmd/...
+
+  image-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build container (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: stripenav:smoke
+
+      - name: Boot-and-fail-fast smoke test
+        run: |
+          # The container should exit with code 1 when STRIPE_WEBHOOK_SECRET is unset.
+          docker run --rm stripenav:smoke || exit_code=$?
+          if [ "${exit_code:-0}" -ne 1 ]; then
+            echo "expected exit 1 with missing env, got ${exit_code:-0}"
+            exit 1
+          fi

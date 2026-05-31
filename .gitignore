@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+# Build / test artefacts
+*.test
+*.out
+coverage.out
+
+# Local IDE state
+.idea/
+.vscode/
+.claude/
+go.work
