@@ -97,6 +97,11 @@ func main() {
 		},
 		Store:                store,
 		ExchangeRateProvider: devRateProvider,
+		WorkerTickInterval:   parseDurationOr("WORKER_TICK_INTERVAL", 0),
+	}
+
+	if cfg.WorkerTickInterval > 0 {
+		logger.Info("worker tick interval overridden", "interval", cfg.WorkerTickInterval)
 	}
 
 	h, err := stripenav.Handler(cfg)
@@ -168,6 +173,21 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseDurationOr reads a duration env var. Empty / unset → fallback.
+// Bad format → fallback + a warning, so a typo never crashes startup.
+func parseDurationOr(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("ignoring invalid duration env var", "key", key, "value", v, "err", err)
+		return fallback
+	}
+	return d
 }
 
 // runHealthcheck implements the `--healthcheck` self-check used by
