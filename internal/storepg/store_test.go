@@ -2,6 +2,7 @@ package storepg_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -121,7 +122,7 @@ func TestStore_UpdateStatusAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestStore_ListPendingFiltersAndOrders(t *testing.T) {
+func TestStore_ClaimBatchFiltersAndOrders(t *testing.T) {
 	s := freshStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -147,18 +148,12 @@ func TestStore_ListPendingFiltersAndOrders(t *testing.T) {
 		}
 	}
 
-	got, err := s.ListPending(ctx, now, 10)
+	got, err := s.ClaimBatch(ctx, "worker-claim-test", 10, 60*time.Second)
 	if err != nil {
-		t.Fatalf("ListPending: %v", err)
+		t.Fatalf("ClaimBatch: %v", err)
 	}
 
 	wantIDs := []string{"evt_pg_list_a_" + stamp, "evt_pg_list_d_" + stamp}
-	if len(got) < len(wantIDs) {
-		t.Fatalf("ListPending returned %d rows, want at least %d (%+v)", len(got), len(wantIDs), got)
-	}
-
-	// We may pick up rows from prior tests in the same DB; filter to the
-	// stamp prefix so the assertion is robust.
 	picked := make([]string, 0, len(got))
 	for _, sub := range got {
 		if strings.Contains(sub.EventID, stamp) {
@@ -170,9 +165,131 @@ func TestStore_ListPendingFiltersAndOrders(t *testing.T) {
 	}
 	for i, id := range wantIDs {
 		if picked[i] != id {
-			t.Errorf("ListPending order[%d] = %s, want %s", i, picked[i], id)
+			t.Errorf("ClaimBatch order[%d] = %s, want %s", i, picked[i], id)
 		}
 	}
+	// Every returned row should carry the claim info.
+	for _, c := range got {
+		if c.ClaimedBy != "worker-claim-test" {
+			t.Errorf("row %s: ClaimedBy=%q, want worker-claim-test", c.EventID, c.ClaimedBy)
+		}
+		if c.ClaimedUntil.IsZero() {
+			t.Errorf("row %s: ClaimedUntil zero", c.EventID)
+		}
+	}
+}
+
+// TestStore_ClaimBatchConcurrentClaimers asserts that two parallel
+// claimers see disjoint row sets — the SELECT … FOR UPDATE SKIP LOCKED
+// semantic that makes multi-replica safe.
+func TestStore_ClaimBatchConcurrentClaimers(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	stamp := now.Format("150405.000000000")
+
+	const total = 20
+	for i := range total {
+		ev := sub("evt_pg_claim_race_"+stamp+"_"+itoa(i),
+			"INV-PG-RACE-"+stamp+"-"+itoa(i),
+			stripenav.StatusPending, now.Add(-time.Second))
+		if err := s.Put(ctx, ev); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	const claimers = 10
+	type result struct {
+		claimer string
+		ids     []string
+	}
+	results := make(chan result, claimers)
+	for c := range claimers {
+		go func(c int) {
+			claimer := "claimer-" + itoa(c)
+			out, err := s.ClaimBatch(ctx, claimer, 4, 60*time.Second)
+			if err != nil {
+				t.Errorf("ClaimBatch(%s): %v", claimer, err)
+				results <- result{claimer, nil}
+				return
+			}
+			ids := make([]string, 0, len(out))
+			for _, sub := range out {
+				if strings.Contains(sub.EventID, stamp) {
+					ids = append(ids, sub.EventID)
+				}
+			}
+			results <- result{claimer, ids}
+		}(c)
+	}
+
+	seen := map[string]string{}
+	for range claimers {
+		r := <-results
+		for _, id := range r.ids {
+			if owner, dup := seen[id]; dup {
+				t.Errorf("row %s claimed by BOTH %s and %s — SKIP LOCKED is broken", id, owner, r.claimer)
+			}
+			seen[id] = r.claimer
+		}
+	}
+}
+
+func TestStore_RenewAndReleaseClaim(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	stamp := time.Now().Format("150405.000000000")
+	eventID := "evt_pg_renew_" + stamp
+
+	if err := s.Put(ctx, sub(eventID, "INV-PG-RENEW-"+stamp,
+		stripenav.StatusPending, time.Now().Add(-time.Second))); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimBatch(ctx, "worker-A", 1, 30*time.Second)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimBatch: err=%v len=%d", err, len(claimed))
+	}
+	originalUntil := claimed[0].ClaimedUntil
+
+	if err := s.RenewClaim(ctx, eventID, "worker-A", 120*time.Second); err != nil {
+		t.Fatalf("RenewClaim by owner: %v", err)
+	}
+	got, _ := s.Get(ctx, eventID)
+	if !got.ClaimedUntil.After(originalUntil) {
+		t.Errorf("ClaimedUntil did not extend: was %v, now %v", originalUntil, got.ClaimedUntil)
+	}
+
+	if err := s.RenewClaim(ctx, eventID, "imposter", 60*time.Second); !errors.Is(err, stripenav.ErrClaimLost) {
+		t.Errorf("RenewClaim by imposter: %v, want ErrClaimLost", err)
+	}
+
+	if err := s.ReleaseClaim(ctx, eventID, "worker-A"); err != nil {
+		t.Fatalf("ReleaseClaim by owner: %v", err)
+	}
+	got, _ = s.Get(ctx, eventID)
+	if got.ClaimedBy != "" {
+		t.Errorf("ClaimedBy not cleared after release: %q", got.ClaimedBy)
+	}
+
+	if err := s.ReleaseClaim(ctx, eventID, "imposter"); !errors.Is(err, stripenav.ErrClaimLost) {
+		t.Errorf("ReleaseClaim by imposter on unclaimed row: %v, want ErrClaimLost", err)
+	}
+}
+
+func itoa(i int) string {
+	const digits = "0123456789"
+	if i == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = digits[i%10]
+		i /= 10
+	}
+	return string(buf[pos:])
 }
 
 func TestStore_FindByInvoiceNumber(t *testing.T) {

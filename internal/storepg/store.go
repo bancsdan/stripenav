@@ -1,11 +1,13 @@
-// Package storepg is the Postgres SubmissionStore implementation used by
-// the gostripenav binary when STORE_URL has a postgres:// scheme.
+// Package storepg is the Postgres SubmissionStore implementation used
+// by the stripenav binary when STORE_URL has a postgres:// scheme.
 //
-// The schema is embedded via go:embed and applied (idempotently) on
-// Open. Atomic state updates use SELECT … FOR UPDATE inside a
-// transaction; multi-worker safety is currently limited to that — see
-// the package doc for the operational note on running a single worker
-// per Postgres until claim-with-skip-locked is added.
+// All bridge state lives in a dedicated `stripenav` schema. The schema
+// is created (if missing) and migrated to the current version on
+// Open. Multi-replica safety is provided by ClaimBatch using
+// SELECT … FOR UPDATE SKIP LOCKED inside a single UPDATE … RETURNING
+// statement: concurrent claimers always receive disjoint row sets.
+// Each claim carries a TTL lease so a crashed claimer's work becomes
+// available to another worker after the lease expires.
 package storepg
 
 import (
@@ -13,6 +15,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	stripenav "github.com/bancsdan/go-stripenav"
@@ -60,8 +63,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	return s, nil
 }
 
-// Close releases the underlying pool. Safe to call multiple times via
-// the pool's own protection.
+// Close releases the underlying pool.
 func (s *Store) Close() {
 	s.pool.Close()
 }
@@ -71,8 +73,18 @@ func (s *Store) applyMigrations(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("storepg: read embedded migration: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, string(sqlBytes)); err != nil {
-		return fmt.Errorf("storepg: apply migration: %w", err)
+	// pgx uses the extended query protocol which executes only the
+	// first statement. Split the migration on `;` and run each
+	// statement individually. The migration intentionally has no
+	// procedures or DO blocks, so a naive split is safe.
+	for _, stmt := range strings.Split(string(sqlBytes), ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("storepg: apply migration: %w\nstatement: %s", err, stmt)
+		}
 	}
 	return nil
 }
@@ -82,18 +94,20 @@ func (s *Store) applyMigrations(ctx context.Context) error {
 const columnList = `
 	event_id, kind, operation, invoice_number, parent_event_id,
 	status, attempts, last_error, transaction_id,
-	next_attempt_at, issued_at, created_at, updated_at, raw_event
+	next_attempt_at, issued_at, created_at, updated_at, raw_event,
+	claimed_by, claimed_until
 `
 
 // Put inserts a new submission. Returns a non-nil error if the event id
 // already exists, so the webhook handler's dedup path triggers.
 func (s *Store) Put(ctx context.Context, sub stripenav.Submission) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO stripenav_submissions (
+		INSERT INTO stripenav.submissions (
 			event_id, kind, operation, invoice_number, parent_event_id,
 			status, attempts, last_error, transaction_id,
-			next_attempt_at, issued_at, created_at, updated_at, raw_event
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			next_attempt_at, issued_at, created_at, updated_at, raw_event,
+			claimed_by, claimed_until
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, NULL)
 	`,
 		sub.EventID, string(sub.Kind), sub.Operation, sub.InvoiceNumber,
 		nullable(sub.ParentEventID),
@@ -114,7 +128,7 @@ func (s *Store) Put(ctx context.Context, sub stripenav.Submission) error {
 
 // Get returns the submission for eventID or stripenav.ErrNotFound.
 func (s *Store) Get(ctx context.Context, eventID string) (stripenav.Submission, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+columnList+` FROM stripenav_submissions WHERE event_id = $1`, eventID)
+	row := s.pool.QueryRow(ctx, `SELECT `+columnList+` FROM stripenav.submissions WHERE event_id = $1`, eventID)
 	sub, err := scanOne(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return stripenav.Submission{}, stripenav.ErrNotFound
@@ -126,8 +140,8 @@ func (s *Store) Get(ctx context.Context, eventID string) (stripenav.Submission, 
 }
 
 // UpdateStatus loads the row under SELECT … FOR UPDATE, calls mut,
-// and writes back — all in one transaction. Concurrent workers
-// touching the same row serialise here.
+// and writes back — all in one transaction. Concurrent mutators of
+// the same row serialise here.
 func (s *Store) UpdateStatus(ctx context.Context, eventID string, mut func(*stripenav.Submission) error) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -135,7 +149,7 @@ func (s *Store) UpdateStatus(ctx context.Context, eventID string, mut func(*stri
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	row := tx.QueryRow(ctx, `SELECT `+columnList+` FROM stripenav_submissions WHERE event_id = $1 FOR UPDATE`, eventID)
+	row := tx.QueryRow(ctx, `SELECT `+columnList+` FROM stripenav.submissions WHERE event_id = $1 FOR UPDATE`, eventID)
 	sub, err := scanOne(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return stripenav.ErrNotFound
@@ -150,17 +164,17 @@ func (s *Store) UpdateStatus(ctx context.Context, eventID string, mut func(*stri
 	sub.UpdatedAt = time.Now().UTC()
 
 	if _, err := tx.Exec(ctx, `
-		UPDATE stripenav_submissions SET
-			operation = $2,
-			status = $3,
-			attempts = $4,
-			last_error = $5,
-			transaction_id = $6,
+		UPDATE stripenav.submissions SET
+			operation       = $2,
+			status          = $3,
+			attempts        = $4,
+			last_error      = $5,
+			transaction_id  = $6,
 			next_attempt_at = $7,
-			updated_at = $8,
-			raw_event = $9,
+			updated_at      = $8,
+			raw_event       = $9,
 			parent_event_id = $10,
-			invoice_number = $11
+			invoice_number  = $11
 		WHERE event_id = $1
 	`,
 		eventID,
@@ -179,26 +193,102 @@ func (s *Store) UpdateStatus(ctx context.Context, eventID string, mut func(*stri
 	return nil
 }
 
-// ListPending returns non-terminal submissions whose NextAttemptAt has
-// elapsed. Caller is responsible for processing them; UpdateStatus does
-// the per-row locking when each is touched.
-func (s *Store) ListPending(ctx context.Context, before time.Time, limit int) ([]stripenav.Submission, error) {
+// ClaimBatch atomically reserves up to limit non-terminal rows that
+// are due and not currently held by a live claim. The implementation
+// uses a single UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED) so
+// concurrent claimers from different replicas always receive disjoint
+// rows: the SKIP LOCKED clause means contended rows are silently
+// passed over rather than blocked on.
+func (s *Store) ClaimBatch(ctx context.Context, claimer string, limit int, lease time.Duration) ([]stripenav.Submission, error) {
 	if limit <= 0 {
 		return nil, errors.New("storepg: limit must be > 0")
 	}
+	if claimer == "" {
+		return nil, errors.New("storepg: claimer is required")
+	}
+	until := time.Now().UTC().Add(lease)
 	rows, err := s.pool.Query(ctx, `
-		SELECT `+columnList+`
-		FROM stripenav_submissions
-		WHERE status IN ('pending', 'submitted', 'processing')
-		  AND next_attempt_at <= $1
-		ORDER BY created_at ASC
-		LIMIT $2
-	`, before.UTC(), limit)
+		UPDATE stripenav.submissions
+		   SET claimed_by    = $1,
+		       claimed_until = $2,
+		       updated_at    = now()
+		 WHERE event_id IN (
+		     SELECT event_id
+		       FROM stripenav.submissions
+		      WHERE status IN ('pending', 'submitted', 'processing')
+		        AND next_attempt_at <= now()
+		        AND (claimed_by IS NULL OR claimed_until IS NULL OR claimed_until < now())
+		      ORDER BY created_at ASC
+		      LIMIT $3
+		      FOR UPDATE SKIP LOCKED
+		 )
+		 RETURNING `+columnList+`
+	`, claimer, until, limit)
 	if err != nil {
-		return nil, fmt.Errorf("storepg: list pending: %w", err)
+		return nil, fmt.Errorf("storepg: claim batch: %w", err)
 	}
 	defer rows.Close()
 	return scanMany(rows)
+}
+
+// RenewClaim extends the lease on a row that claimer already holds.
+// Returns stripenav.ErrClaimLost if the row no longer belongs to
+// claimer (lease expired and stolen by another worker, or the row was
+// released).
+func (s *Store) RenewClaim(ctx context.Context, eventID, claimer string, lease time.Duration) error {
+	if claimer == "" {
+		return errors.New("storepg: claimer is required")
+	}
+	until := time.Now().UTC().Add(lease)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE stripenav.submissions
+		   SET claimed_until = $3,
+		       updated_at    = now()
+		 WHERE event_id = $1
+		   AND claimed_by = $2
+	`, eventID, claimer, until)
+	if err != nil {
+		return fmt.Errorf("storepg: renew claim: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the row is gone or some other claimer owns it now.
+		// Distinguish for a clearer error.
+		var exists bool
+		_ = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripenav.submissions WHERE event_id = $1)`, eventID).Scan(&exists)
+		if !exists {
+			return stripenav.ErrNotFound
+		}
+		return stripenav.ErrClaimLost
+	}
+	return nil
+}
+
+// ReleaseClaim clears claimer's hold on the row. Returns
+// stripenav.ErrClaimLost if the row no longer belongs to claimer.
+func (s *Store) ReleaseClaim(ctx context.Context, eventID, claimer string) error {
+	if claimer == "" {
+		return errors.New("storepg: claimer is required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE stripenav.submissions
+		   SET claimed_by    = NULL,
+		       claimed_until = NULL,
+		       updated_at    = now()
+		 WHERE event_id = $1
+		   AND claimed_by = $2
+	`, eventID, claimer)
+	if err != nil {
+		return fmt.Errorf("storepg: release claim: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		_ = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripenav.submissions WHERE event_id = $1)`, eventID).Scan(&exists)
+		if !exists {
+			return stripenav.ErrNotFound
+		}
+		return stripenav.ErrClaimLost
+	}
+	return nil
 }
 
 // FindByInvoiceNumber returns all submissions recorded for the given
@@ -206,7 +296,7 @@ func (s *Store) ListPending(ctx context.Context, before time.Time, limit int) ([
 func (s *Store) FindByInvoiceNumber(ctx context.Context, invoiceNumber string) ([]stripenav.Submission, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+columnList+`
-		FROM stripenav_submissions
+		FROM stripenav.submissions
 		WHERE invoice_number = $1
 		ORDER BY created_at ASC
 	`, invoiceNumber)
@@ -219,15 +309,18 @@ func (s *Store) FindByInvoiceNumber(ctx context.Context, invoiceNumber string) (
 
 func scanOne(row pgx.Row) (stripenav.Submission, error) {
 	var (
-		sub             stripenav.Submission
-		kind, status    string
-		parentEventID   *string
+		sub           stripenav.Submission
+		kind, status  string
+		parentEventID *string
+		claimedBy     *string
+		claimedUntil  *time.Time
 	)
 	if err := row.Scan(
 		&sub.EventID, &kind, &sub.Operation, &sub.InvoiceNumber, &parentEventID,
 		&status, &sub.Attempts, &sub.LastError, &sub.TransactionID,
 		&sub.NextAttemptAt, &sub.IssuedAt, &sub.CreatedAt, &sub.UpdatedAt,
 		&sub.RawEvent,
+		&claimedBy, &claimedUntil,
 	); err != nil {
 		return stripenav.Submission{}, err
 	}
@@ -235,6 +328,12 @@ func scanOne(row pgx.Row) (stripenav.Submission, error) {
 	sub.Status = stripenav.SubmissionStatus(status)
 	if parentEventID != nil {
 		sub.ParentEventID = *parentEventID
+	}
+	if claimedBy != nil {
+		sub.ClaimedBy = *claimedBy
+	}
+	if claimedUntil != nil {
+		sub.ClaimedUntil = *claimedUntil
 	}
 	return sub, nil
 }

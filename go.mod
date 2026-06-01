@@ -18,7 +18,7 @@ module github.com/bancsdan/stripenav
 go 1.26.2
 
 require (
-	github.com/bancsdan/go-stripenav v0.2.0
+	github.com/bancsdan/go-stripenav v0.3.0
 	github.com/jackc/pgx/v5 v5.9.2
 )
 

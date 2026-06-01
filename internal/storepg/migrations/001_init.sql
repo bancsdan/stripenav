@@ -1,10 +1,13 @@
 -- 001_init.sql
 -- Initial schema for the Postgres SubmissionStore adapter.
 --
--- Applied on store open via embedded SQL — idempotent (IF NOT EXISTS
--- everywhere) so it's safe to run on every boot.
+-- All bridge state lives in a dedicated `stripenav` schema. Applied on
+-- store open via embedded SQL — idempotent (IF NOT EXISTS everywhere)
+-- so it's safe to run on every boot.
 
-CREATE TABLE IF NOT EXISTS stripenav_submissions (
+CREATE SCHEMA IF NOT EXISTS stripenav;
+
+CREATE TABLE IF NOT EXISTS stripenav.submissions (
     event_id          TEXT PRIMARY KEY,
     kind              TEXT NOT NULL,
     operation         TEXT NOT NULL,
@@ -18,14 +21,16 @@ CREATE TABLE IF NOT EXISTS stripenav_submissions (
     issued_at         TIMESTAMPTZ NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL,
     updated_at        TIMESTAMPTZ NOT NULL,
-    raw_event         BYTEA NOT NULL
+    raw_event         BYTEA NOT NULL,
+    claimed_by        TEXT,
+    claimed_until     TIMESTAMPTZ
 );
 
 -- For findParentSubmission lookup in the webhook handler.
-CREATE INDEX IF NOT EXISTS stripenav_submissions_invoice_number_idx
-    ON stripenav_submissions(invoice_number);
+CREATE INDEX IF NOT EXISTS submissions_invoice_number_idx
+    ON stripenav.submissions(invoice_number);
 
--- For worker tick (ListPending). Partial index keeps it small.
-CREATE INDEX IF NOT EXISTS stripenav_submissions_pending_idx
-    ON stripenav_submissions(next_attempt_at)
+-- For ClaimBatch. Partial index keeps it small.
+CREATE INDEX IF NOT EXISTS submissions_claimable_idx
+    ON stripenav.submissions(next_attempt_at)
     WHERE status IN ('pending', 'submitted', 'processing');

@@ -97,11 +97,17 @@ func main() {
 		},
 		Store:                store,
 		ExchangeRateProvider: devRateProvider,
-		WorkerTickInterval:   parseDurationOr("WORKER_TICK_INTERVAL", 0),
+		WorkerMaxSleep:       parseDurationOr("WORKER_MAX_SLEEP", 0),
+		WorkerPollInterval:   parseDurationOr("WORKER_POLL_INTERVAL", 0),
+		WorkerLeaseDuration:  parseDurationOr("WORKER_LEASE_DURATION", 0),
+		WorkerClaimerID:      os.Getenv("WORKER_CLAIMER_ID"),
 	}
 
-	if cfg.WorkerTickInterval > 0 {
-		logger.Info("worker tick interval overridden", "interval", cfg.WorkerTickInterval)
+	if cfg.WorkerMaxSleep > 0 {
+		logger.Info("worker max sleep overridden", "max_sleep", cfg.WorkerMaxSleep)
+	}
+	if cfg.WorkerPollInterval > 0 {
+		logger.Info("worker poll interval overridden", "poll_interval", cfg.WorkerPollInterval)
 	}
 
 	h, err := stripenav.Handler(cfg)
